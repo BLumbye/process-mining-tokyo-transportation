@@ -2,3 +2,4 @@
 .env
 toei-bus.json
 toei-bus.pb
+*jsonl
