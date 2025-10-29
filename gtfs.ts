@@ -33,18 +33,18 @@ export async function fetchAndSaveGtfsData(baseUrl: string, filePath: string) {
     }
   )
 
-  function busJSONReplacer(key: string, value: any) {
-    // Remove empty objects and arrays
-    switch (value) {
-      case "multiCarriageDetails":
-      case "licensePlate":
-        return undefined
-    }
+  // function busJSONReplacer(key: string, value: any) {
+  //   // Remove empty objects and arrays
+  //   switch (value) {
+  //     case "multiCarriageDetails":
+  //     case "licensePlate":
+  //       return undefined
+  //   }
 
-    return value
-  }
+  //   return value
+  // }
 
 
   // Save to file
-  await appendFile(filePath, JSON.stringify(feedObject, busJSONReplacer) + "\n", "utf-8")
+  await appendFile(filePath, JSON.stringify(feedObject, null) + "\n", "utf-8", { createDirs: true })
 }
