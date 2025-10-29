@@ -1,14 +1,17 @@
 // Decode GTFS Realtime (protobuf) feed and save as JSON
-import * as GtfsRealtimeBindings from "gtfs-realtime-bindings"
-import { appendFile } from "fs/promises"
+import * as GtfsRealtimeBindings from 'gtfs-realtime-bindings'
+import { appendFile } from 'fs/promises'
 
-
-export async function fetchAndSaveGtfsData(baseUrl: string, filePath: string) {
+export async function fetchAndSaveGtfsData(
+  baseUrl: string,
+  filePath: string,
+  accessToken: string
+) {
   const u = new URL(baseUrl)
-  u.searchParams.set("acl:consumerKey", process.env.BASIC_TOKEN!)
+  u.searchParams.set('acl:consumerKey', accessToken)
 
   const response = await fetch(u.toString(), {
-    method: "GET",
+    method: 'GET',
   })
 
   if (!response.ok) {
@@ -44,7 +47,6 @@ export async function fetchAndSaveGtfsData(baseUrl: string, filePath: string) {
   //   return value
   // }
 
-
   // Save to file
-  await appendFile(filePath, JSON.stringify(feedObject, null) + "\n", "utf-8")
+  await appendFile(filePath, JSON.stringify(feedObject, null) + '\n', 'utf-8')
 }
