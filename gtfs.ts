@@ -46,5 +46,5 @@ export async function fetchAndSaveGtfsData(baseUrl: string, filePath: string) {
 
 
   // Save to file
-  await appendFile(filePath, JSON.stringify(feedObject, null) + "\n", "utf-8", { createDirs: true })
+  await appendFile(filePath, JSON.stringify(feedObject, null) + "\n", "utf-8")
 }
