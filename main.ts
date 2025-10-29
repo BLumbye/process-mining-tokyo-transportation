@@ -24,9 +24,9 @@ setInterval(() => {
         const currentDate = new Date().toISOString().split('T')[0];
         const filePath = path.join(process.env.OUTPUT_DIR, currentDate + `-${data.baseFileName}.jsonl`)
 
-        // fetchAndSaveGtfsData(baseUrl, filePath).then(() => {
-        //     console.log("test");
-        // });
+        fetchAndSaveGtfsData(baseUrl, filePath).then(() => {
+            
+        });
     }
 
 }, RUN_EVERY_X_SECONDS * 1000);
