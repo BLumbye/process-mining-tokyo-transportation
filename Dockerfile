@@ -19,7 +19,5 @@ COPY . .
 # Ensure the monitor script is executable even if host permissions were lost
 RUN chmod +x scripts/monitor.sh || true
 
-USER bun
-
 # Default command runs the monitor which runs the app and notifies on crash
 ENTRYPOINT ["bun", "run", "run:monitor"]
