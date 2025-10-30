@@ -4,6 +4,7 @@
     "gtfs-realtime-bindings": "^1.1.1"
   },
   "scripts": {
-    "run": "bun main.ts"
+    "run": "bun main.ts",
+    "run:monitor": "sh scripts/monitor.sh"
   }
 }
