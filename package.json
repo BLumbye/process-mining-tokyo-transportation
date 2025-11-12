@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "csv-parse": "^6.1.0",
     "gtfs-realtime-bindings": "^1.1.1",
     "protobufjs": "^7.5.4",
     "xmlbuilder2": "^4.0.0"

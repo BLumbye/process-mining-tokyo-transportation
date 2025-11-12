@@ -4,22 +4,28 @@ import { OutputFile } from './output-file-types'
 import { create } from 'xmlbuilder2'
 import path from 'node:path'
 import { createReadStream } from 'node:fs'
+import { parse } from 'csv-parse/sync'
 
 interface XESTrace {
-  vehicleId: string
+  id: string
+  tripId: string
+  routeId: string
+  lineName: string
   events: XESEvent[]
 }
 
 interface XESEvent {
-  fromStop: number
-  toStop: number
+  stopSequence: number
+  stopId: string
+  stopName: string
   // beforeTimestamp: string
   afterTimestamp: string
   // latitude: number;
   // longitude: number;
 }
 
-const baseFileTypes = ['TobuTrain', 'ToeiBus', 'ToeiTrain']
+// const baseFileTypes = ['TobuTrain', 'ToeiBus', 'ToeiTrain']
+const baseFileTypes = ['ToeiBus']
 
 for (const baseFileType of baseFileTypes) {
   convertXES(baseFileType)
@@ -36,6 +42,38 @@ async function convertXES(baseFileName: string): Promise<void> {
 
   const traces = new Map<string, XESTrace>()
   const previousStates = new Map<string, { stop: number; timestamp: string }>()
+
+  // Load static files
+  const tripsCsv = await Bun.file(`./${baseFileName}-static/trips.txt`).text()
+  const routesCsv = await Bun.file(`./${baseFileName}-static/routes.txt`).text()
+  const stopsCsv = await Bun.file(`./${baseFileName}-static/stops.txt`).text()
+  const stopTimesCsv = await Bun.file(
+    `./${baseFileName}-static/stop_times.txt`
+  ).text()
+  const translationsCsv = await Bun.file(
+    `./${baseFileName}-static/translations.txt`
+  ).text()
+
+  const trips = parse(tripsCsv, {
+    columns: true,
+    skip_empty_lines: true,
+  }) as Record<string, string>[]
+  const routes = parse(routesCsv, {
+    columns: true,
+    skip_empty_lines: true,
+  }) as Record<string, string>[]
+  const translations = parse(translationsCsv, {
+    columns: true,
+    skip_empty_lines: true,
+  }) as Record<string, string>[]
+  const stops = parse(stopsCsv, {
+    columns: true,
+    skip_empty_lines: true,
+  }) as Record<string, string>[]
+  const stopTimes = parse(stopTimesCsv, {
+    columns: true,
+    skip_empty_lines: true,
+  }) as Record<string, string>[]
 
   // Go through files
   for (let fileName of filteredFiles) {
@@ -61,9 +99,10 @@ async function convertXES(baseFileName: string): Promise<void> {
         if (previousStates.has(entity.id)) {
           const previousState = previousStates.get(entity.id)!
           if (previousState.stop !== nextState.stop) {
+            // Bus id
+
             const event: XESEvent = {
-              fromStop: previousState.stop,
-              toStop: nextState.stop,
+              stopSequence: nextState.stop,
               // beforeTimestamp: previousState.timestamp,
               afterTimestamp: nextState.timestamp,
               // latitude: entity.vehicle.position.latitude,
@@ -74,8 +113,21 @@ async function convertXES(baseFileName: string): Promise<void> {
               const trace = traces.get(entity.id)!
               trace.events.push(event)
             } else {
+              // traceId is not empty string (but routeIdcan be)
+              const tripId = entity.vehicle.trip.tripId
+              const routeId = entity.vehicle.trip.routeId
+
+              const lookupRouteId = trips.find(
+                (trip) => trip.trip_id === tripId
+              )?.route_id
+
+              if (routeId !== '' && routeId !== lookupRouteId)
+                throw Error(
+                  "lookup route id doesn't match route id in source json"
+                )
+
               traces.set(entity.id, {
-                vehicleId: entity.id,
+                id: entity.id,
                 events: [event],
               })
             }
@@ -117,7 +169,7 @@ async function convertXES(baseFileName: string): Promise<void> {
   for (const trace of traces.values()) {
     const traceElement = xes
       .ele('trace')
-      .ele('string', { key: 'concept:name', value: trace.vehicleId })
+      .ele('string', { key: 'concept:name', value: trace.id })
       .up()
 
     for (const event of trace.events) {
