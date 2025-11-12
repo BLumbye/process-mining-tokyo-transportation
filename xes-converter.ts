@@ -106,8 +106,12 @@ async function convertXES(baseFileName: string): Promise<void> {
             const lookupStopId = stopTimes.find(
               (stopTime) =>
                 stopTime.trip_id === entity.vehicle.trip.tripId &&
-                Number(stopTime.stop_sequence) === nextState.stop
-            )!.stop_id;
+                stopTime.stop_sequence === nextState.stop.toString()
+            )?.stop_id;
+
+            if (lookupStopId == undefined) {
+              continue;
+            }
 
             const lookupStopName = stops.find(
               (stop) => stop.stop_id === lookupStopId
@@ -116,10 +120,11 @@ async function convertXES(baseFileName: string): Promise<void> {
             let lookupStopEnglishName: string | undefined;
 
             if (baseFileName.includes("Bus")) {
-              lookupStopEnglishName = translations.find((translation) => {
-                translation.record_id === lookupStopId &&
-                  translation.language === "en";
-              })?.translation;
+              lookupStopEnglishName = translations.find(
+                (translation) =>
+                  translation.record_id === lookupStopId &&
+                  translation.language === "en"
+              )!.translation;
 
               if (lookupStopEnglishName == undefined) {
                 throw Error(
@@ -169,11 +174,10 @@ async function convertXES(baseFileName: string): Promise<void> {
               let lookupLongRouteEnglishName: string | undefined;
               if (baseFileName.includes("Bus")) {
                 lookupLongRouteEnglishName = translations.find(
-                  (translation) => {
+                  (translation) =>
                     translation.field_value === lookupRouteId.trip_headsign &&
-                      translation.language === "en";
-                  }
-                )?.translation;
+                    translation.language === "en"
+                )!.translation;
 
                 if (lookupLongRouteEnglishName == undefined) {
                   throw Error(
