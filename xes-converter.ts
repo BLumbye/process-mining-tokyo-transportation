@@ -1,10 +1,10 @@
 import readline from 'readline'
-import { readdir, writeFile } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
 import { OutputFile } from './output-file-types'
-import { create } from 'xmlbuilder2'
 import path from 'node:path'
-import { createReadStream } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
 import { parse } from 'csv-parse/sync'
+import { MultiBar, Presets, SingleBar } from 'cli-progress'
 
 interface XESTrace {
   id: string
@@ -115,14 +115,12 @@ function lookupEventStaticData(
   baseFileName: string,
   tripId: string,
   stopSequence: number
-): { stopId: string; stopName: string } {
+): { stopId: string; stopName: string } | null {
   const key = `${tripId}:${stopSequence}`
   const lookupStopId = staticData.stopTimesByTripAndSequence.get(key)
 
   if (lookupStopId == undefined) {
-    throw Error(
-      `Stop id not found for trip_id ${tripId} and stop_sequence ${stopSequence}`
-    )
+    return null
   }
 
   const lookupStop = staticData.stopsById.get(lookupStopId)
@@ -213,22 +211,9 @@ function lookupTraceStaticData(
   }
 }
 
-async function convertXES(baseFileName: string): Promise<void> {
-  console.log(`Starting ${baseFileName}`)
-
-  if (!process.env.OUTPUT_DIR) {
-    throw Error('OUTPUT_DIR environment variable is not set')
-  }
-
-  // Find all files in output
-  const allFiles = await readdir(process.env.OUTPUT_DIR)
-  const filteredFiles = allFiles.filter((file) =>
-    file.includes(`${baseFileName}.jsonl`)
-  )
-
-  const traces = new Map<string, XESTrace>()
-  const previousStates = new Map<string, { stop: number; timestamp: string }>()
-
+async function loadAndPreprocessStaticData(
+  baseFileName: string
+): Promise<OptimizedStaticData> {
   // Load static files
   const tripsCsv = await Bun.file(`./${baseFileName}-static/trips.txt`).text()
   const routesCsv = await Bun.file(`./${baseFileName}-static/routes.txt`).text()
@@ -272,153 +257,285 @@ async function convertXES(baseFileName: string): Promise<void> {
   console.log('Preprocessing static data into maps for fast lookup...')
   const optimizedStaticData = preprocessStaticData(staticData)
   console.log('Static data preprocessing complete')
+  return optimizedStaticData
+}
 
-  // Go through files
-  for (let fileName of filteredFiles) {
-    console.log(`Processing ${fileName}`)
+function processLine(
+  line: string,
+  baseFileName: string,
+  optimizedStaticData: OptimizedStaticData,
+  traces: Map<string, XESTrace>,
+  previousStates: Map<string, { stop: number; timestamp: string }>,
+  multibar: MultiBar,
+  fileName: string,
+  lineNo: number,
+  loggedMissingTripIds: Set<string>
+) {
+  const lineJson = JSON.parse(line) as OutputFile
+  for (const entity of lineJson.entity) {
+    if (entity.vehicle.trip.tripId === '') continue
 
-    const rl = readline.createInterface({
-      input: createReadStream(path.join(process.env.OUTPUT_DIR, fileName)),
-      crlfDelay: Infinity,
-    })
+    const nextState = {
+      stop: entity.vehicle.currentStopSequence,
+      timestamp: entity.vehicle.timestamp,
+    }
 
-    //setup data structure for XML/XES format
-    let lineNo = 1
-    for await (const line of rl) {
-      console.log(`Processing line ${lineNo} of ${fileName}`)
-      lineNo++
-      const lineJson = JSON.parse(line) as OutputFile
-      for (const entity of lineJson.entity) {
-        if (entity.vehicle.trip.tripId === '') continue
+    if (previousStates.has(entity.id)) {
+      const previousState = previousStates.get(entity.id)!
 
-        const nextState = {
-          stop: entity.vehicle.currentStopSequence,
-          timestamp: entity.vehicle.timestamp,
-        }
+      if (previousState.stop !== nextState.stop) {
+        try {
+          const eventStaticData = lookupEventStaticData(
+            optimizedStaticData,
+            baseFileName,
+            entity.vehicle.trip.tripId,
+            nextState.stop
+          )
 
-        if (previousStates.has(entity.id)) {
-          const previousState = previousStates.get(entity.id)!
-
-          if (previousState.stop !== nextState.stop) {
-            try {
-              const eventStaticData = lookupEventStaticData(
-                optimizedStaticData,
-                baseFileName,
-                entity.vehicle.trip.tripId,
-                nextState.stop
+          if (eventStaticData == null) {
+            const tripId = entity.vehicle.trip.tripId
+            if (!loggedMissingTripIds.has(tripId)) {
+              multibar.log(
+                `Error in ${fileName}: Stop id not found for trip_id ${tripId}\n`
               )
-
-              if (eventStaticData == null) {
-                continue
-              }
-
-              const event: XESEvent = {
-                stopSequence: nextState.stop,
-                stopId: eventStaticData.stopId,
-                stopName: eventStaticData.stopName,
-                afterTimestamp: nextState.timestamp,
-                // latitude: entity.vehicle.position.latitude,
-                // longitude: entity.vehicle.position.longitude,
-              }
-
-              if (traces.has(entity.id)) {
-                const trace = traces.get(entity.id)!
-                trace.events.push(event)
-              } else {
-                // traceId is not empty string (but routeIdcan be)
-                const tripId = entity.vehicle.trip.tripId
-                const routeId = entity.vehicle.trip.routeId
-
-                const traceStaticData = lookupTraceStaticData(
-                  optimizedStaticData,
-                  baseFileName,
-                  tripId,
-                  routeId
-                )
-
-                traces.set(entity.id, {
-                  id: entity.id,
-                  tripId: tripId,
-                  routeId: traceStaticData.routeId,
-                  lineName: traceStaticData.lineName,
-                  events: [event],
-                })
-              }
-            } catch (err) {
-              console.error(err)
-              continue
+              loggedMissingTripIds.add(tripId)
             }
+            continue
           }
-        }
 
-        previousStates.set(entity.id, nextState)
+          const event: XESEvent = {
+            stopSequence: nextState.stop,
+            stopId: eventStaticData.stopId,
+            stopName: eventStaticData.stopName,
+            afterTimestamp: nextState.timestamp,
+            // latitude: entity.vehicle.position.latitude,
+            // longitude: entity.vehicle.position.longitude,
+          }
+
+          if (traces.has(entity.id)) {
+            const trace = traces.get(entity.id)!
+            trace.events.push(event)
+          } else {
+            // traceId is not empty string (but routeId can be)
+            const tripId = entity.vehicle.trip.tripId
+            const routeId = entity.vehicle.trip.routeId
+
+            const traceStaticData = lookupTraceStaticData(
+              optimizedStaticData,
+              baseFileName,
+              tripId,
+              routeId
+            )
+
+            traces.set(entity.id, {
+              id: entity.id,
+              tripId: tripId,
+              routeId: traceStaticData.routeId,
+              lineName: traceStaticData.lineName,
+              events: [event],
+            })
+          }
+        } catch (err) {
+          multibar.log(`Error in ${fileName} line ${lineNo}: ${err}\n`)
+          continue
+        }
       }
     }
-  }
 
-  // Convert to XES format
-  const xes = create({ version: '1.0', encoding: 'UTF-8' })
-    .ele('log', {
-      'xes.version': '1.0',
-      'xes.features': 'nested-attributes',
-      'openxes.version': '1.0RC7',
-      xmlns: 'http://www.xes-standard.org/',
-    })
-    .ele('extension', {
-      name: 'Time',
-      prefix: 'time',
-      uri: 'http://www.xes-standard.org/time.xesext',
-    })
-    .up()
-    .ele('extension', {
-      name: 'Concept',
-      prefix: 'concept',
-      uri: 'http://www.xes-standard.org/concept.xesext',
-    })
-    .up()
-    .ele('string', {
-      key: 'concept:name',
-      value: baseFileName,
-    })
-    .up()
+    previousStates.set(entity.id, nextState)
+  }
+}
+
+async function processLogFile(
+  fileName: string,
+  baseFileName: string,
+  optimizedStaticData: OptimizedStaticData,
+  traces: Map<string, XESTrace>,
+  previousStates: Map<string, { stop: number; timestamp: string }>,
+  multibar: MultiBar,
+  bar: SingleBar,
+  loggedMissingTripIds: Set<string>
+) {
+  const filePath = path.join(process.env.OUTPUT_DIR!, fileName)
+
+  const fileStream = createReadStream(filePath)
+  fileStream.on('data', (chunk: Buffer | string) => {
+    bar.increment(chunk.length)
+  })
+
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity,
+  })
+
+  //setup data structure for XML/XES format
+  let lineNo = 1
+
+  for await (const line of rl) {
+    lineNo++
+    try {
+      processLine(
+        line,
+        baseFileName,
+        optimizedStaticData,
+        traces,
+        previousStates,
+        multibar,
+        fileName,
+        lineNo,
+        loggedMissingTripIds
+      )
+    } catch (err) {
+      multibar.log(`Error in ${fileName} line ${lineNo}: ${err}\n`)
+    }
+  }
+}
+
+function escapeXml(unsafe: string | number): string {
+  return String(unsafe).replace(/[<>&'"]/g, (c) => {
+    switch (c) {
+      case '<':
+        return '&lt;'
+      case '>':
+        return '&gt;'
+      case '&':
+        return '&amp;'
+      case "'":
+        return '&apos;'
+      case '"':
+        return '&quot;'
+    }
+    return c
+  })
+}
+
+async function writeXESFile(
+  baseFileName: string,
+  traces: Map<string, XESTrace>,
+  multibar: MultiBar
+) {
+  const bar = multibar.create(traces.size, 0)
+  const outputFile = path.join(process.env.OUTPUT_DIR!, `${baseFileName}.xes`)
+  const stream = createWriteStream(outputFile, {
+    encoding: 'utf-8',
+    highWaterMark: 1024 * 1024, // 1MB buffer
+  })
+
+  // Write Header
+  stream.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+  stream.write(
+    '<log xes.version="1.0" xes.features="nested-attributes" openxes.version="1.0RC7" xmlns="http://www.xes-standard.org/">\n'
+  )
+  stream.write(
+    '  <extension name="Time" prefix="time" uri="http://www.xes-standard.org/time.xesext"/>\n'
+  )
+  stream.write(
+    '  <extension name="Concept" prefix="concept" uri="http://www.xes-standard.org/concept.xesext"/>\n'
+  )
+  stream.write(
+    `  <string key="concept:name" value="${escapeXml(baseFileName)}"/>\n`
+  )
 
   // Add traces
   for (const trace of traces.values()) {
-    const traceElement = xes
-      .ele('trace')
-      .ele('string', { key: 'concept:name', value: trace.id })
-      .ele('string', { key: 'tripId', value: trace.tripId })
-      .ele('string', { key: 'routeId', value: trace.routeId })
-      .ele('string', { key: 'lineName', value: trace.lineName })
-      .up()
+    bar.increment()
+
+    let traceXml = '  <trace>\n'
+    traceXml += `    <string key="concept:name" value="${escapeXml(trace.id)}"/>\n`
+    traceXml += `    <string key="tripId" value="${escapeXml(trace.tripId)}"/>\n`
+    traceXml += `    <string key="routeId" value="${escapeXml(trace.routeId)}"/>\n`
+    traceXml += `    <string key="lineName" value="${escapeXml(trace.lineName)}"/>\n`
 
     // Add events
     for (const event of trace.events) {
-      const eventElement = traceElement.ele('event')
-      eventElement.ele('string', {
-        key: 'concept:name',
-        value: 'currentStopSequenceChanged',
-      })
-      eventElement.ele('date', {
-        key: 'time:timestamp',
-        value: new Date(Number(event.afterTimestamp) * 1000).toISOString(),
-      })
-      eventElement.ele('int', {
-        key: 'stopSequence',
-        values: event.stopSequence,
-      })
-      eventElement.ele('string', {
-        key: 'stopId',
-        value: event.stopId,
-      })
-      eventElement.ele('string', {
-        key: 'stopName',
-        value: event.stopName,
-      })
+      const timestamp = new Date(
+        Number(event.afterTimestamp) * 1000
+      ).toISOString()
+      traceXml += '    <event>\n'
+      traceXml +=
+        '      <string key="concept:name" value="currentStopSequenceChanged"/>\n'
+      traceXml += `      <date key="time:timestamp" value="${timestamp}"/>\n`
+      traceXml += `      <int key="stopSequence" value="${escapeXml(
+        event.stopSequence
+      )}"/>\n`
+      traceXml += `      <string key="stopId" value="${escapeXml(
+        event.stopId
+      )}"/>\n`
+      traceXml += `      <string key="stopName" value="${escapeXml(
+        event.stopName
+      )}"/>\n`
+      traceXml += '    </event>\n'
+    }
+    traceXml += '  </trace>\n'
+
+    const ok = stream.write(traceXml)
+
+    if (!ok) {
+      await new Promise<void>((resolve) => stream.once('drain', resolve))
     }
   }
 
-  const outputFile = path.join(process.env.OUTPUT_DIR, `${baseFileName}.xes`)
-  writeFile(outputFile, xes.end({ prettyPrint: true }), 'utf-8')
-  console.log(`Finished ${baseFileName}, output to ${outputFile}`)
+  stream.write('</log>')
+  stream.end()
+
+  await new Promise<void>((resolve, reject) => {
+    stream.on('finish', resolve)
+    stream.on('error', reject)
+  })
+}
+
+async function convertXES(baseFileName: string): Promise<void> {
+  console.log(`Starting ${baseFileName}`)
+
+  if (!process.env.OUTPUT_DIR) {
+    throw Error('OUTPUT_DIR environment variable is not set')
+  }
+
+  // Find all files in output
+  const allFiles = await readdir(process.env.OUTPUT_DIR)
+  const filteredFiles = allFiles.filter((file) =>
+    file.includes(`${baseFileName}.jsonl`)
+  )
+
+  const optimizedStaticData = await loadAndPreprocessStaticData(baseFileName)
+
+  const traces = new Map<string, XESTrace>()
+  const previousStates = new Map<string, { stop: number; timestamp: string }>()
+  const loggedMissingTripIds = new Set<string>()
+
+  let totalSize = 0
+  for (const fileName of filteredFiles) {
+    const filePath = path.join(process.env.OUTPUT_DIR, fileName)
+    const { size } = await stat(filePath)
+    totalSize += size
+  }
+
+  const multibar = new MultiBar({}, Presets.shades_classic)
+  const bar = multibar.create(totalSize, 0)
+
+  // Go through files
+  for (let fileName of filteredFiles) {
+    // bar.log(`Processing ${fileName}\n`)
+    await processLogFile(
+      fileName,
+      baseFileName,
+      optimizedStaticData,
+      traces,
+      previousStates,
+      multibar,
+      bar,
+      loggedMissingTripIds
+    )
+  }
+
+  multibar.log('writing xes file...')
+
+  await writeXESFile(baseFileName, traces, multibar)
+  multibar.stop()
+  console.log(
+    `Finished ${baseFileName}, output to ${path.join(
+      process.env.OUTPUT_DIR!,
+      `${baseFileName}.xes`
+    )}`
+  )
 }
