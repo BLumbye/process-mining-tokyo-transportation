@@ -20,6 +20,7 @@ interface XESEvent {
   stopName: string
   // beforeTimestamp: string
   afterTimestamp: string
+  expectedTimestamp: string
   // latitude: number;
   // longitude: number;
 }
@@ -42,8 +43,11 @@ interface OptimizedStaticData {
   routesById: Map<string, Record<string, string>>
   // Map from stop_id to stop record
   stopsById: Map<string, Record<string, string>>
-  // Map from "trip_id:stop_sequence" to stop_id
-  stopTimesByTripAndSequence: Map<string, string>
+  // Map from "trip_id:stop_sequence" to { stopId, departureTime }
+  stopTimesByTripAndSequence: Map<
+    string,
+    { stopId: string; departureTime: string }
+  >
   // For Bus: Map from record_id (stop_id) to English translation
   // For Train: Map from field_value (stop/route name) to English translation
   translationsByRecordId: Map<string, string>
@@ -73,11 +77,17 @@ function preprocessStaticData(staticData: StaticData): OptimizedStaticData {
     stopsById.set(stop.stop_id, stop)
   }
 
-  // Build stop times map (composite key: "trip_id:stop_sequence" -> stop_id)
-  const stopTimesByTripAndSequence = new Map<string, string>()
+  // Build stop times map (composite key: "trip_id:stop_sequence" -> { stop_id, departure_time })
+  const stopTimesByTripAndSequence = new Map<
+    string,
+    { stopId: string; departureTime: string }
+  >()
   for (const stopTime of staticData.stopTimes) {
     const key = `${stopTime.trip_id}:${stopTime.stop_sequence}`
-    stopTimesByTripAndSequence.set(key, stopTime.stop_id)
+    stopTimesByTripAndSequence.set(key, {
+      stopId: stopTime.stop_id,
+      departureTime: stopTime.departure_time,
+    })
   }
 
   // Build translation maps
@@ -115,13 +125,15 @@ function lookupEventStaticData(
   baseFileName: string,
   tripId: string,
   stopSequence: number
-): { stopId: string; stopName: string } | null {
+): { stopId: string; stopName: string; departureTime: string } | null {
   const key = `${tripId}:${stopSequence}`
-  const lookupStopId = staticData.stopTimesByTripAndSequence.get(key)
+  const lookupData = staticData.stopTimesByTripAndSequence.get(key)
 
-  if (lookupStopId == undefined) {
+  if (lookupData == undefined) {
     return null
   }
+
+  const { stopId: lookupStopId, departureTime } = lookupData
 
   const lookupStop = staticData.stopsById.get(lookupStopId)
 
@@ -155,6 +167,7 @@ function lookupEventStaticData(
   return {
     stopId: lookupStopId,
     stopName: lookupStopEnglishName,
+    departureTime,
   }
 }
 
@@ -260,6 +273,27 @@ async function loadAndPreprocessStaticData(
   return optimizedStaticData
 }
 
+function calculateExpectedTimestamp(
+  fileName: string,
+  departureTime: string
+): string {
+  // fileName example: 2025-10-30-ToeiBus.jsonl
+  const datePart = fileName.substring(0, 10) // "2025-10-30"
+  const [year, month, day] = datePart.split('-').map(Number)
+
+  const [hoursStr, minutesStr, secondsStr] = departureTime.split(':')
+  let hours = Number(hoursStr)
+  const minutes = Number(minutesStr)
+  const seconds = Number(secondsStr)
+
+  // Convert JST to UTC
+  hours -= 9
+
+  // Date.UTC handles overflow/underflow of components automatically
+  const date = new Date(Date.UTC(year, month - 1, day, hours, minutes, seconds))
+  return date.toISOString()
+}
+
 function processLine(
   line: string,
   baseFileName: string,
@@ -308,6 +342,10 @@ function processLine(
             stopId: eventStaticData.stopId,
             stopName: eventStaticData.stopName,
             afterTimestamp: nextState.timestamp,
+            expectedTimestamp: calculateExpectedTimestamp(
+              fileName,
+              eventStaticData.departureTime
+            ),
             // latitude: entity.vehicle.position.latitude,
             // longitude: entity.vehicle.position.longitude,
           }
@@ -455,6 +493,7 @@ async function writeXESFile(
       traceXml +=
         '      <string key="concept:name" value="currentStopSequenceChanged"/>\n'
       traceXml += `      <date key="time:timestamp" value="${timestamp}"/>\n`
+      traceXml += `      <date key="expectedTimestamp" value="${event.expectedTimestamp}"/>\n`
       traceXml += `      <int key="stopSequence" value="${escapeXml(
         event.stopSequence
       )}"/>\n`
