@@ -31,7 +31,7 @@ async function analysePartialTraces() {
   const tripMaxStopSequence = new Map<string, number>()
   for (const [key] of staticData.stopTimesByTripAndSequence) {
     const [tripId, stopSequenceStr] = key.split(':')
-    const stopSequence = parseInt(stopSequenceStr, 10)
+    const stopSequence = parseInt(stopSequenceStr, 10) - 1
     const currentMax = tripMaxStopSequence.get(tripId) ?? 0
     if (stopSequence > currentMax) {
       tripMaxStopSequence.set(tripId, stopSequence)

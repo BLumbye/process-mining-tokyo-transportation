@@ -1,6 +1,6 @@
 import readline from 'readline'
 import { readdir, stat } from 'node:fs/promises'
-import { OutputFile } from './output-file-types'
+import { Entity, OutputFile } from './output-file-types'
 import path from 'node:path'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { parse } from 'csv-parse/sync'
@@ -299,6 +299,10 @@ function calculateExpectedTimestamp(
   return date.toISOString()
 }
 
+const timeFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Japan',
+})
+
 function processLine(
   line: string,
   baseFileName: string,
@@ -319,73 +323,75 @@ function processLine(
       timestamp: entity.vehicle.timestamp,
     }
 
-    if (previousStates.has(entity.id)) {
-      const previousState = previousStates.get(entity.id)!
+    const date = new Date(Number(entity.vehicle.timestamp) * 1000)
+    const formattedDate = timeFormatter.format(date)
+    const uniqueId = `${entity.vehicle.trip.tripId}:${formattedDate}`
 
-      if (previousState.stop !== nextState.stop) {
-        try {
-          const eventStaticData = lookupEventStaticData(
-            optimizedStaticData,
-            baseFileName,
-            entity.vehicle.trip.tripId,
-            nextState.stop
-          )
+    const previousState = previousStates.get(uniqueId)!
 
-          if (eventStaticData == null) {
-            const tripId = entity.vehicle.trip.tripId
-            if (!loggedMissingTripIds.has(tripId)) {
-              multibar.log(
-                `Error in ${fileName}: Stop id not found for trip_id ${tripId}\n`
-              )
-              loggedMissingTripIds.add(tripId)
-            }
-            continue
-          }
+    if (previousState === undefined || previousState.stop !== nextState.stop) {
+      try {
+        const eventStaticData = lookupEventStaticData(
+          optimizedStaticData,
+          baseFileName,
+          entity.vehicle.trip.tripId,
+          nextState.stop
+        )
 
-          const event: XESEvent = {
-            stopSequence: nextState.stop,
-            stopId: eventStaticData.stopId,
-            stopName: eventStaticData.stopName,
-            afterTimestamp: nextState.timestamp,
-            expectedTimestamp: calculateExpectedTimestamp(
-              fileName,
-              eventStaticData.departureTime
-            ),
-            // latitude: entity.vehicle.position.latitude,
-            // longitude: entity.vehicle.position.longitude,
-          }
-
-          if (traces.has(entity.id)) {
-            const trace = traces.get(entity.id)!
-            trace.events.push(event)
-          } else {
-            // traceId is not empty string (but routeId can be)
-            const tripId = entity.vehicle.trip.tripId
-            const routeId = entity.vehicle.trip.routeId
-
-            const traceStaticData = lookupTraceStaticData(
-              optimizedStaticData,
-              baseFileName,
-              tripId,
-              routeId
+        if (eventStaticData == null) {
+          const tripId = entity.vehicle.trip.tripId
+          if (!loggedMissingTripIds.has(tripId)) {
+            multibar.log(
+              `Error in ${fileName}: Stop id not found for trip_id ${tripId}\n`
             )
-
-            traces.set(entity.id, {
-              id: entity.id,
-              tripId: tripId,
-              routeId: traceStaticData.routeId,
-              lineName: traceStaticData.lineName,
-              events: [event],
-            })
+            loggedMissingTripIds.add(tripId)
           }
-        } catch (err) {
-          multibar.log(`Error in ${fileName} line ${lineNo}: ${err}\n`)
           continue
         }
+
+        const event: XESEvent = {
+          stopSequence: nextState.stop,
+          stopId: eventStaticData.stopId,
+          stopName: eventStaticData.stopName,
+          afterTimestamp: nextState.timestamp,
+          expectedTimestamp: calculateExpectedTimestamp(
+            fileName,
+            eventStaticData.departureTime
+          ),
+          // latitude: entity.vehicle.position.latitude,
+          // longitude: entity.vehicle.position.longitude,
+        }
+
+        if (traces.has(uniqueId)) {
+          const trace = traces.get(uniqueId)!
+          trace.events.push(event)
+        } else {
+          // traceId is not empty string (but routeId can be)
+          const tripId = entity.vehicle.trip.tripId
+          const routeId = entity.vehicle.trip.routeId
+
+          const traceStaticData = lookupTraceStaticData(
+            optimizedStaticData,
+            baseFileName,
+            tripId,
+            routeId
+          )
+
+          traces.set(uniqueId, {
+            id: entity.id,
+            tripId: tripId,
+            routeId: traceStaticData.routeId,
+            lineName: traceStaticData.lineName,
+            events: [event],
+          })
+        }
+      } catch (err) {
+        multibar.log(`Error in ${fileName} line ${lineNo}: ${err}\n`)
+        continue
       }
     }
 
-    previousStates.set(entity.id, nextState)
+    previousStates.set(uniqueId, nextState)
   }
 }
 
