@@ -6,7 +6,7 @@ import { createReadStream, createWriteStream } from 'node:fs'
 import { parse } from 'csv-parse/sync'
 import { MultiBar, Presets, SingleBar } from 'cli-progress'
 
-interface XESTrace {
+export interface XESTrace {
   id: string
   tripId: string
   routeId: string
@@ -14,7 +14,7 @@ interface XESTrace {
   events: XESEvent[]
 }
 
-interface XESEvent {
+export interface XESEvent {
   stopSequence: number
   stopId: string
   stopName: string
@@ -54,11 +54,16 @@ interface OptimizedStaticData {
   translationsByFieldValue: Map<string, string>
 }
 
-for (const baseFileType of baseFileTypes) {
-  convertXES(baseFileType)
+// Only run conversion when this file is executed directly, not when imported
+if (import.meta.main) {
+  for (const baseFileType of baseFileTypes) {
+    convertXES(baseFileType)
+  }
 }
 
-function preprocessStaticData(staticData: StaticData): OptimizedStaticData {
+export function preprocessStaticData(
+  staticData: StaticData
+): OptimizedStaticData {
   // Build trips map
   const tripsById = new Map<string, Record<string, string>>()
   for (const trip of staticData.trips) {
@@ -224,7 +229,7 @@ function lookupTraceStaticData(
   }
 }
 
-async function loadAndPreprocessStaticData(
+export async function loadAndPreprocessStaticData(
   baseFileName: string
 ): Promise<OptimizedStaticData> {
   // Load static files
@@ -570,11 +575,20 @@ async function convertXES(baseFileName: string): Promise<void> {
   multibar.log('writing xes file...')
 
   await writeXESFile(baseFileName, traces, multibar)
+
+  // Also save as JSON
+  const jsonOutputPath = path.join(
+    process.env.OUTPUT_DIR!,
+    `${baseFileName}.json`
+  )
+  const tracesArray = Array.from(traces.values())
+  await Bun.write(jsonOutputPath, JSON.stringify(tracesArray, null, 2))
+
   multibar.stop()
   console.log(
     `Finished ${baseFileName}, output to ${path.join(
       process.env.OUTPUT_DIR!,
       `${baseFileName}.xes`
-    )}`
+    )} and ${jsonOutputPath}`
   )
 }
