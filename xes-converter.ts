@@ -26,7 +26,7 @@ export interface XESEvent {
 }
 
 // const baseFileTypes = ['TobuTrain', 'ToeiBus', 'ToeiTrain']
-const baseFileTypes = ['ToeiBus']
+const baseFileTypes = ['TobuTrain']
 
 interface StaticData {
   trips: Record<string, string>[]
@@ -312,11 +312,16 @@ function processLine(
   multibar: MultiBar,
   fileName: string,
   lineNo: number,
-  loggedMissingTripIds: Set<string>
+  loggedMissingTripIds: Set<string>,
+  filteredTrips: Set<string>
 ) {
   const lineJson = JSON.parse(line) as OutputFile
   for (const entity of lineJson.entity) {
-    if (entity.vehicle.trip.tripId === '') continue
+    if (
+      entity.vehicle.trip.tripId === '' ||
+      filteredTrips.has(entity.vehicle.trip.tripId)
+    )
+      continue
 
     const nextState = {
       stop: entity.vehicle.currentStopSequence,
@@ -346,6 +351,12 @@ function processLine(
             )
             loggedMissingTripIds.add(tripId)
           }
+          continue
+        }
+
+        if (eventStaticData.departureTime === '') {
+          filteredTrips.add(entity.vehicle.trip.tripId)
+          traces.delete(entity.vehicle.trip.tripId)
           continue
         }
 
@@ -386,6 +397,7 @@ function processLine(
           })
         }
       } catch (err) {
+        console.error(err)
         multibar.log(`Error in ${fileName} line ${lineNo}: ${err}\n`)
         continue
       }
@@ -403,7 +415,8 @@ async function processLogFile(
   previousStates: Map<string, { stop: number; timestamp: string }>,
   multibar: MultiBar,
   bar: SingleBar,
-  loggedMissingTripIds: Set<string>
+  loggedMissingTripIds: Set<string>,
+  filteredTrips: Set<string>
 ) {
   const filePath = path.join(process.env.OUTPUT_DIR!, fileName)
 
@@ -432,7 +445,8 @@ async function processLogFile(
         multibar,
         fileName,
         lineNo,
-        loggedMissingTripIds
+        loggedMissingTripIds,
+        filteredTrips
       )
     } catch (err) {
       multibar.log(`Error in ${fileName} line ${lineNo}: ${err}\n`)
@@ -552,6 +566,7 @@ async function convertXES(baseFileName: string): Promise<void> {
   const traces = new Map<string, XESTrace>()
   const previousStates = new Map<string, { stop: number; timestamp: string }>()
   const loggedMissingTripIds = new Set<string>()
+  const filteredTrips = new Set<string>()
 
   let totalSize = 0
   for (const fileName of filteredFiles) {
@@ -574,7 +589,8 @@ async function convertXES(baseFileName: string): Promise<void> {
       previousStates,
       multibar,
       bar,
-      loggedMissingTripIds
+      loggedMissingTripIds,
+      filteredTrips
     )
   }
 
