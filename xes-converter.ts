@@ -454,7 +454,7 @@ async function processLogFile(
   }
 }
 
-function escapeXml(unsafe: string | number): string {
+export function escapeXml(unsafe: string | number): string {
   return String(unsafe).replace(/[<>&'"]/g, (c) => {
     switch (c) {
       case '<':
@@ -472,16 +472,14 @@ function escapeXml(unsafe: string | number): string {
   })
 }
 
-async function writeXESFile(
-  baseFileName: string,
-  traces: Map<string, XESTrace>,
-  multibar: MultiBar
+export async function writeXES(
+  outputPath: string,
+  name: string,
+  traces: XESTrace[]
 ) {
-  const bar = multibar.create(traces.size, 0)
-  const outputFile = path.join(process.env.OUTPUT_DIR!, `${baseFileName}.xes`)
-  const stream = createWriteStream(outputFile, {
+  const stream = createWriteStream(outputPath, {
     encoding: 'utf-8',
-    highWaterMark: 1024 * 1024, // 1MB buffer
+    highWaterMark: 1024 * 1024,
   })
 
   // Write Header
@@ -495,14 +493,10 @@ async function writeXESFile(
   stream.write(
     '  <extension name="Concept" prefix="concept" uri="http://www.xes-standard.org/concept.xesext"/>\n'
   )
-  stream.write(
-    `  <string key="concept:name" value="${escapeXml(baseFileName)}"/>\n`
-  )
+  stream.write(`  <string key="concept:name" value="${escapeXml(name)}"/>\n`)
 
   // Add traces
-  for (const trace of traces.values()) {
-    bar.increment()
-
+  for (const trace of traces) {
     let traceXml = '  <trace>\n'
     traceXml += `    <string key="concept:name" value="${escapeXml(trace.id)}"/>\n`
     traceXml += `    <string key="tripId" value="${escapeXml(trace.tripId)}"/>\n`
@@ -519,21 +513,14 @@ async function writeXESFile(
         '      <string key="concept:name" value="currentStopSequenceChanged"/>\n'
       traceXml += `      <date key="time:timestamp" value="${timestamp}"/>\n`
       traceXml += `      <date key="expectedTimestamp" value="${event.expectedTimestamp}"/>\n`
-      traceXml += `      <int key="stopSequence" value="${escapeXml(
-        event.stopSequence
-      )}"/>\n`
-      traceXml += `      <string key="stopId" value="${escapeXml(
-        event.stopId
-      )}"/>\n`
-      traceXml += `      <string key="stopName" value="${escapeXml(
-        event.stopName
-      )}"/>\n`
+      traceXml += `      <int key="stopSequence" value="${escapeXml(event.stopSequence)}"/>\n`
+      traceXml += `      <string key="stopId" value="${escapeXml(event.stopId)}"/>\n`
+      traceXml += `      <string key="stopName" value="${escapeXml(event.stopName)}"/>\n`
       traceXml += '    </event>\n'
     }
     traceXml += '  </trace>\n'
 
     const ok = stream.write(traceXml)
-
     if (!ok) {
       await new Promise<void>((resolve) => stream.once('drain', resolve))
     }
@@ -596,14 +583,18 @@ async function convertXES(baseFileName: string): Promise<void> {
 
   multibar.log('writing xes file...')
 
-  await writeXESFile(baseFileName, traces, multibar)
+  const tracesArray = Array.from(traces.values())
+  const xesOutputPath = path.join(
+    process.env.OUTPUT_DIR!,
+    `${baseFileName}.xes`
+  )
+  await writeXES(xesOutputPath, baseFileName, tracesArray)
 
   // Also save as JSON
   const jsonOutputPath = path.join(
     process.env.OUTPUT_DIR!,
     `${baseFileName}.json`
   )
-  const tracesArray = Array.from(traces.values())
   await Bun.write(jsonOutputPath, JSON.stringify(tracesArray, null, 2))
 
   multibar.stop()
