@@ -116,16 +116,6 @@ function extractUniqueRouteVariants(
   const stopsById = new Map(stops.map((s) => [s.stop_id, s]))
   const routesById = new Map(routes.map((r) => [r.route_id, r]))
 
-  // Group trips by route_id, direction_id, and shape_id (to get unique route variants)
-  const tripsByVariant = new Map<string, Trip>()
-  for (const trip of trips) {
-    // Use shape_id if available, otherwise use first trip per route+direction
-    const variantKey = `${trip.route_id}:${trip.direction_id}:${trip.shape_id || 'default'}`
-    if (!tripsByVariant.has(variantKey)) {
-      tripsByVariant.set(variantKey, trip)
-    }
-  }
-
   // Group stop_times by trip_id for quick lookup
   const stopTimesByTrip = new Map<string, StopTime[]>()
   for (const st of stopTimes) {
@@ -135,16 +125,35 @@ function extractUniqueRouteVariants(
     stopTimesByTrip.get(st.trip_id)!.push(st)
   }
 
-  const routeVariants: RouteStopSequence[] = []
+  // Build unique route variants based on actual stop sequences
+  // Key: stop sequence signature (stop_ids joined), Value: first trip with this sequence
+  const uniqueSequences = new Map<string, { trip: Trip; stopIds: string[] }>()
 
-  for (const [variantKey, trip] of tripsByVariant) {
-    const route = routesById.get(trip.route_id)
-    if (!route) continue
-
+  for (const trip of trips) {
     const tripStopTimes = stopTimesByTrip.get(trip.trip_id)
     if (!tripStopTimes || tripStopTimes.length === 0) continue
 
     // Sort by stop_sequence
+    const sortedStopTimes = [...tripStopTimes].sort(
+      (a, b) => parseInt(a.stop_sequence) - parseInt(b.stop_sequence)
+    )
+
+    // Create a signature based on the actual stop sequence
+    const stopIds = sortedStopTimes.map((st) => st.stop_id)
+    const sequenceSignature = stopIds.join('|')
+
+    if (!uniqueSequences.has(sequenceSignature)) {
+      uniqueSequences.set(sequenceSignature, { trip, stopIds })
+    }
+  }
+
+  const routeVariants: RouteStopSequence[] = []
+
+  for (const [sequenceSignature, { trip, stopIds }] of uniqueSequences) {
+    const route = routesById.get(trip.route_id)
+    if (!route) continue
+
+    const tripStopTimes = stopTimesByTrip.get(trip.trip_id)!
     const sortedStopTimes = [...tripStopTimes].sort(
       (a, b) => parseInt(a.stop_sequence) - parseInt(b.stop_sequence)
     )
@@ -187,6 +196,22 @@ function sanitizeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^(\d)/, '_$1')
 }
 
+interface StopNode {
+  stopId: string
+  stopName: string
+  x: number
+  y: number
+  incomingRoutes: Set<string> // route variant keys that lead TO this stop
+  outgoingRoutes: Set<string> // route variant keys that lead FROM this stop
+  hasSelfLoop: boolean // whether this stop has a self-loop (same stop appears consecutively)
+}
+
+interface RouteEdge {
+  fromStopId: string | 'START_GATEWAY'
+  toStopId: string | 'END_GATEWAY'
+  routeVariantKey: string
+}
+
 async function generateBpmn(baseFileName: ValidBaseFileName) {
   console.log(`Loading static data for ${baseFileName}...`)
   const { routes, trips, stops, stopTimes, translations } =
@@ -203,6 +228,125 @@ async function generateBpmn(baseFileName: ValidBaseFileName) {
   )
 
   console.log(`Found ${routeVariants.length} unique route variants`)
+
+  // Build a graph of unique stops and edges between them
+  const uniqueStops = new Map<string, StopNode>()
+  const edges: RouteEdge[] = []
+
+  // Collect all unique stops and build edges
+  for (const routeVariant of routeVariants) {
+    const routeKey = `${routeVariant.routeId}_dir${routeVariant.directionId}_${routeVariant.shapeId}`
+
+    for (let i = 0; i < routeVariant.stops.length; i++) {
+      const stop = routeVariant.stops[i]
+
+      // Use stopName as key for merging (stops with same name become one node)
+      if (!uniqueStops.has(stop.stopName)) {
+        uniqueStops.set(stop.stopName, {
+          stopId: stop.stopId,
+          stopName: stop.stopName,
+          x: 0,
+          y: 0,
+          incomingRoutes: new Set(),
+          outgoingRoutes: new Set(),
+          hasSelfLoop: false,
+        })
+      }
+
+      const stopNode = uniqueStops.get(stop.stopName)!
+
+      // First stop - edge from start gateway
+      if (i === 0) {
+        edges.push({
+          fromStopId: 'START_GATEWAY',
+          toStopId: stop.stopName,
+          routeVariantKey: routeKey,
+        })
+        stopNode.incomingRoutes.add(routeKey)
+      }
+
+      // Edge to next stop
+      if (i < routeVariant.stops.length - 1) {
+        const nextStop = routeVariant.stops[i + 1]
+        // Check for self-loop (same stop name appears consecutively)
+        if (stop.stopName === nextStop.stopName) {
+          // Mark this stop as having a self-loop instead of creating an edge
+          stopNode.hasSelfLoop = true
+        } else {
+          edges.push({
+            fromStopId: stop.stopName,
+            toStopId: nextStop.stopName,
+            routeVariantKey: routeKey,
+          })
+          stopNode.outgoingRoutes.add(routeKey)
+        }
+      }
+
+      // Last stop - edge to end gateway
+      if (i === routeVariant.stops.length - 1) {
+        edges.push({
+          fromStopId: stop.stopName,
+          toStopId: 'END_GATEWAY',
+          routeVariantKey: routeKey,
+        })
+        stopNode.outgoingRoutes.add(routeKey)
+      }
+    }
+  }
+
+  console.log(`Merged into ${uniqueStops.size} unique stops`)
+
+  // Count stops with self-loops
+  const selfLoopCount = Array.from(uniqueStops.values()).filter(
+    (s) => s.hasSelfLoop
+  ).length
+  console.log(`Found ${selfLoopCount} stops with self-loops`)
+
+  // Deduplicate edges (same from -> to might appear in multiple routes)
+  const uniqueEdges = new Map<string, RouteEdge>()
+  for (const edge of edges) {
+    const edgeKey = `${edge.fromStopId}:${edge.toStopId}`
+    if (!uniqueEdges.has(edgeKey)) {
+      uniqueEdges.set(edgeKey, edge)
+    }
+  }
+
+  console.log(`Created ${uniqueEdges.size} unique edges`)
+
+  // Count incoming and outgoing edges for each stop
+  const incomingEdgeCount = new Map<string, number>()
+  const outgoingEdgeCount = new Map<string, number>()
+
+  for (const [, edge] of uniqueEdges) {
+    if (edge.toStopId !== 'END_GATEWAY') {
+      incomingEdgeCount.set(
+        edge.toStopId,
+        (incomingEdgeCount.get(edge.toStopId) || 0) + 1
+      )
+    }
+    if (edge.fromStopId !== 'START_GATEWAY') {
+      outgoingEdgeCount.set(
+        edge.fromStopId,
+        (outgoingEdgeCount.get(edge.fromStopId) || 0) + 1
+      )
+    }
+  }
+
+  // Identify stops that need gateways
+  const stopsNeedingSplitGateway = new Set<string>()
+  const stopsNeedingMergeGateway = new Set<string>()
+
+  for (const [stopName] of uniqueStops) {
+    if ((outgoingEdgeCount.get(stopName) || 0) > 1) {
+      stopsNeedingSplitGateway.add(stopName)
+    }
+    if ((incomingEdgeCount.get(stopName) || 0) > 1) {
+      stopsNeedingMergeGateway.add(stopName)
+    }
+  }
+
+  console.log(`Stops needing split gateway: ${stopsNeedingSplitGateway.size}`)
+  console.log(`Stops needing merge gateway: ${stopsNeedingMergeGateway.size}`)
 
   const moddle = new BpmnModdle()
 
@@ -227,205 +371,436 @@ async function generateBpmn(baseFileName: ValidBaseFileName) {
 
   bpmnDiagram.plane = plane
 
-  // Create a collaboration to hold all processes (routes)
-  const collaboration = moddle.create('bpmn:Collaboration', {
-    id: `Collaboration_${sanitizeId(baseFileName)}`,
-    participants: [],
+  // Create a single process
+  const process = moddle.create('bpmn:Process', {
+    id: `Process_${sanitizeId(baseFileName)}`,
+    name: `${baseFileName} Transportation Network`,
+    isExecutable: false,
+    flowElements: [],
   })
 
-  definitions.rootElements.push(collaboration)
-  plane.bpmnElement = collaboration
+  definitions.rootElements.push(process)
+  plane.bpmnElement = process
 
-  let yOffset = 0
-  const LANE_HEIGHT = 120
+  // Layout constants
   const ELEMENT_WIDTH = 100
   const ELEMENT_HEIGHT = 80
-  const HORIZONTAL_SPACING = 150
+  const GATEWAY_SIZE = 50
+  const HORIZONTAL_SPACING = 180
+  const VERTICAL_SPACING = 100
   const START_X = 50
+  const START_Y = 50
 
-  for (const routeVariant of routeVariants) {
-    const processId = `Process_${sanitizeId(routeVariant.routeId)}_dir${routeVariant.directionId}_${sanitizeId(routeVariant.shapeId)}`
-    const participantId = `Participant_${sanitizeId(routeVariant.routeId)}_dir${routeVariant.directionId}_${sanitizeId(routeVariant.shapeId)}`
+  // Calculate grid layout for stops
+  const stopsArray = Array.from(uniqueStops.values())
+  const gridCols = Math.ceil(Math.sqrt(stopsArray.length))
 
-    // Create process for this route variant
-    const process = moddle.create('bpmn:Process', {
-      id: processId,
-      name: `${routeVariant.routeName} (Direction ${routeVariant.directionId})`,
-      isExecutable: false,
-      flowElements: [],
-    })
+  // Assign positions to stops in a grid
+  stopsArray.forEach((stop, index) => {
+    const col = index % gridCols
+    const row = Math.floor(index / gridCols)
+    stop.x = START_X + HORIZONTAL_SPACING + col * HORIZONTAL_SPACING
+    stop.y = START_Y + GATEWAY_SIZE + 50 + row * VERTICAL_SPACING
+  })
 
-    definitions.rootElements.push(process)
+  // Find bounds for gateway positioning
+  const maxX = Math.max(...stopsArray.map((s) => s.x)) + ELEMENT_WIDTH
+  const maxY = Math.max(...stopsArray.map((s) => s.y)) + ELEMENT_HEIGHT
+  const centerY = (START_Y + maxY) / 2
 
-    // Create participant (lane in collaboration)
-    const participant = moddle.create('bpmn:Participant', {
-      id: participantId,
-      name: `${routeVariant.routeName} (Dir ${routeVariant.directionId})`,
-      processRef: process,
-    })
+  // Map to store BPMN elements by their key
+  const bpmnElements = new Map<string, any>()
 
-    collaboration.participants.push(participant)
+  // Track all sequence flows to add incoming/outgoing references later
+  const allFlows: { flow: any; sourceElement: any; targetElement: any }[] = []
 
-    // Calculate process width based on number of stops
-    const processWidth =
-      START_X + (routeVariant.stops.length + 2) * HORIZONTAL_SPACING + 50
+  // Create start event
+  const startEvent = moddle.create('bpmn:StartEvent', {
+    id: 'StartEvent_1',
+    name: 'Start',
+    outgoing: [],
+  })
+  process.flowElements.push(startEvent)
+  bpmnElements.set('START', startEvent)
 
-    // Add participant shape to diagram
-    const participantBounds = moddle.create('dc:Bounds', {
-      x: 0,
-      y: yOffset,
-      width: processWidth,
-      height: LANE_HEIGHT,
-    })
-
-    const participantShape = moddle.create('bpmndi:BPMNShape', {
-      id: `${participantId}_di`,
-      bpmnElement: participant,
-      bounds: participantBounds,
-      isHorizontal: true,
-    })
-
-    plane.planeElement.push(participantShape)
-
-    // Create start event
-    const startEventId = `StartEvent_${processId}`
-    const startEvent = moddle.create('bpmn:StartEvent', {
-      id: startEventId,
-      name: 'Start',
-    })
-    process.flowElements.push(startEvent)
-
-    // Add start event shape
-    const startBounds = moddle.create('dc:Bounds', {
-      x: START_X,
-      y: yOffset + (LANE_HEIGHT - 36) / 2,
-      width: 36,
-      height: 36,
-    })
-
-    const startShape = moddle.create('bpmndi:BPMNShape', {
-      id: `${startEventId}_di`,
+  const startBounds = moddle.create('dc:Bounds', {
+    x: START_X - 100,
+    y: centerY - 18,
+    width: 36,
+    height: 36,
+  })
+  plane.planeElement.push(
+    moddle.create('bpmndi:BPMNShape', {
+      id: 'StartEvent_1_di',
       bpmnElement: startEvent,
       bounds: startBounds,
     })
+  )
 
-    plane.planeElement.push(startShape)
+  // Create start gateway (exclusive, splitting)
+  const startGateway = moddle.create('bpmn:ExclusiveGateway', {
+    id: 'Gateway_Start',
+    name: 'Select Route',
+    incoming: [],
+    outgoing: [],
+  })
+  process.flowElements.push(startGateway)
+  bpmnElements.set('START_GATEWAY', startGateway)
 
-    let previousElement: any = startEvent
-    let previousX = START_X + 36
-    let elementIndex = 0
+  const startGatewayBounds = moddle.create('dc:Bounds', {
+    x: START_X - 25,
+    y: centerY - GATEWAY_SIZE / 2,
+    width: GATEWAY_SIZE,
+    height: GATEWAY_SIZE,
+  })
+  plane.planeElement.push(
+    moddle.create('bpmndi:BPMNShape', {
+      id: 'Gateway_Start_di',
+      bpmnElement: startGateway,
+      bounds: startGatewayBounds,
+      isMarkerVisible: true,
+    })
+  )
 
-    // Create task for each stop
-    for (const stop of routeVariant.stops) {
-      elementIndex++
-      const taskId = `Task_${processId}_stop${stop.sequence}`
-      const task = moddle.create('bpmn:Task', {
-        id: taskId,
-        name: stop.stopName,
+  // Create flow from start event to start gateway
+  const startToGatewayFlow = moddle.create('bpmn:SequenceFlow', {
+    id: 'Flow_Start_to_Gateway',
+    sourceRef: startEvent,
+    targetRef: startGateway,
+  })
+  process.flowElements.push(startToGatewayFlow)
+  allFlows.push({
+    flow: startToGatewayFlow,
+    sourceElement: startEvent,
+    targetElement: startGateway,
+  })
+  plane.planeElement.push(
+    moddle.create('bpmndi:BPMNEdge', {
+      id: 'Flow_Start_to_Gateway_di',
+      bpmnElement: startToGatewayFlow,
+      waypoint: [
+        moddle.create('dc:Point', { x: START_X - 64, y: centerY }),
+        moddle.create('dc:Point', { x: START_X - 25, y: centerY }),
+      ],
+    })
+  )
+
+  // Create end gateway (exclusive, merging)
+  const endGateway = moddle.create('bpmn:ExclusiveGateway', {
+    id: 'Gateway_End',
+    name: 'Routes Complete',
+    incoming: [],
+    outgoing: [],
+  })
+  process.flowElements.push(endGateway)
+  bpmnElements.set('END_GATEWAY', endGateway)
+
+  const endGatewayBounds = moddle.create('dc:Bounds', {
+    x: maxX + HORIZONTAL_SPACING,
+    y: centerY - GATEWAY_SIZE / 2,
+    width: GATEWAY_SIZE,
+    height: GATEWAY_SIZE,
+  })
+  plane.planeElement.push(
+    moddle.create('bpmndi:BPMNShape', {
+      id: 'Gateway_End_di',
+      bpmnElement: endGateway,
+      bounds: endGatewayBounds,
+      isMarkerVisible: true,
+    })
+  )
+
+  // Create end event
+  const endEvent = moddle.create('bpmn:EndEvent', {
+    id: 'EndEvent_1',
+    name: 'End',
+    incoming: [],
+  })
+  process.flowElements.push(endEvent)
+  bpmnElements.set('END', endEvent)
+
+  const endBounds = moddle.create('dc:Bounds', {
+    x: maxX + HORIZONTAL_SPACING + GATEWAY_SIZE + 50,
+    y: centerY - 18,
+    width: 36,
+    height: 36,
+  })
+  plane.planeElement.push(
+    moddle.create('bpmndi:BPMNShape', {
+      id: 'EndEvent_1_di',
+      bpmnElement: endEvent,
+      bounds: endBounds,
+    })
+  )
+
+  // Create flow from end gateway to end event
+  const gatewayToEndFlow = moddle.create('bpmn:SequenceFlow', {
+    id: 'Flow_Gateway_to_End',
+    sourceRef: endGateway,
+    targetRef: endEvent,
+  })
+  process.flowElements.push(gatewayToEndFlow)
+  allFlows.push({
+    flow: gatewayToEndFlow,
+    sourceElement: endGateway,
+    targetElement: endEvent,
+  })
+  plane.planeElement.push(
+    moddle.create('bpmndi:BPMNEdge', {
+      id: 'Flow_Gateway_to_End_di',
+      bpmnElement: gatewayToEndFlow,
+      waypoint: [
+        moddle.create('dc:Point', {
+          x: maxX + HORIZONTAL_SPACING + GATEWAY_SIZE,
+          y: centerY,
+        }),
+        moddle.create('dc:Point', {
+          x: maxX + HORIZONTAL_SPACING + GATEWAY_SIZE + 50,
+          y: centerY,
+        }),
+      ],
+    })
+  )
+
+  // Create tasks for each unique stop (and associated gateways if needed)
+  for (const [stopName, stop] of uniqueStops) {
+    const taskId = `Task_${sanitizeId(stopName)}`
+
+    // If stop has a self-loop, add a standard loop characteristic
+    let loopCharacteristics = undefined
+    if (stop.hasSelfLoop) {
+      loopCharacteristics = moddle.create('bpmn:StandardLoopCharacteristics', {
+        id: `Loop_${sanitizeId(stopName)}`,
       })
-      process.flowElements.push(task)
+    }
 
-      // Add task shape
-      const taskX = START_X + elementIndex * HORIZONTAL_SPACING
-      const taskBounds = moddle.create('dc:Bounds', {
-        x: taskX,
-        y: yOffset + (LANE_HEIGHT - ELEMENT_HEIGHT) / 2,
-        width: ELEMENT_WIDTH,
-        height: ELEMENT_HEIGHT,
-      })
+    const task = moddle.create('bpmn:Task', {
+      id: taskId,
+      name: stopName,
+      loopCharacteristics: loopCharacteristics,
+      incoming: [],
+      outgoing: [],
+    })
+    process.flowElements.push(task)
+    bpmnElements.set(stopName, task)
 
-      const taskShape = moddle.create('bpmndi:BPMNShape', {
+    const taskBounds = moddle.create('dc:Bounds', {
+      x: stop.x,
+      y: stop.y,
+      width: ELEMENT_WIDTH,
+      height: ELEMENT_HEIGHT,
+    })
+    plane.planeElement.push(
+      moddle.create('bpmndi:BPMNShape', {
         id: `${taskId}_di`,
         bpmnElement: task,
         bounds: taskBounds,
       })
+    )
 
-      plane.planeElement.push(taskShape)
+    // Create merge gateway before task if needed (for multiple incoming edges)
+    if (stopsNeedingMergeGateway.has(stopName)) {
+      const mergeGatewayId = `Gateway_Merge_${sanitizeId(stopName)}`
+      const mergeGateway = moddle.create('bpmn:ExclusiveGateway', {
+        id: mergeGatewayId,
+        incoming: [],
+        outgoing: [],
+      })
+      process.flowElements.push(mergeGateway)
+      bpmnElements.set(`MERGE_${stopName}`, mergeGateway)
 
-      // Create sequence flow from previous element
-      const flowId = `Flow_${processId}_${elementIndex}`
-      const flow = moddle.create('bpmn:SequenceFlow', {
-        id: flowId,
-        sourceRef: previousElement,
+      // Position merge gateway to the left of the task
+      const mergeGatewayBounds = moddle.create('dc:Bounds', {
+        x: stop.x - GATEWAY_SIZE - 20,
+        y: stop.y + (ELEMENT_HEIGHT - GATEWAY_SIZE) / 2,
+        width: GATEWAY_SIZE,
+        height: GATEWAY_SIZE,
+      })
+      plane.planeElement.push(
+        moddle.create('bpmndi:BPMNShape', {
+          id: `${mergeGatewayId}_di`,
+          bpmnElement: mergeGateway,
+          bounds: mergeGatewayBounds,
+          isMarkerVisible: true,
+        })
+      )
+
+      // Create flow from merge gateway to task
+      const mergeToTaskFlowId = `Flow_Merge_to_${sanitizeId(stopName)}`
+      const mergeToTaskFlow = moddle.create('bpmn:SequenceFlow', {
+        id: mergeToTaskFlowId,
+        sourceRef: mergeGateway,
         targetRef: task,
       })
-      process.flowElements.push(flow)
+      process.flowElements.push(mergeToTaskFlow)
+      allFlows.push({
+        flow: mergeToTaskFlow,
+        sourceElement: mergeGateway,
+        targetElement: task,
+      })
+      plane.planeElement.push(
+        moddle.create('bpmndi:BPMNEdge', {
+          id: `${mergeToTaskFlowId}_di`,
+          bpmnElement: mergeToTaskFlow,
+          waypoint: [
+            moddle.create('dc:Point', {
+              x: stop.x - 20,
+              y: stop.y + ELEMENT_HEIGHT / 2,
+            }),
+            moddle.create('dc:Point', {
+              x: stop.x,
+              y: stop.y + ELEMENT_HEIGHT / 2,
+            }),
+          ],
+        })
+      )
+    }
 
-      // Add flow edge
-      const flowEdge = moddle.create('bpmndi:BPMNEdge', {
+    // Create split gateway after task if needed (for multiple outgoing edges)
+    if (stopsNeedingSplitGateway.has(stopName)) {
+      const splitGatewayId = `Gateway_Split_${sanitizeId(stopName)}`
+      const splitGateway = moddle.create('bpmn:ExclusiveGateway', {
+        id: splitGatewayId,
+        incoming: [],
+        outgoing: [],
+      })
+      process.flowElements.push(splitGateway)
+      bpmnElements.set(`SPLIT_${stopName}`, splitGateway)
+
+      // Position split gateway to the right of the task
+      const splitGatewayBounds = moddle.create('dc:Bounds', {
+        x: stop.x + ELEMENT_WIDTH + 20,
+        y: stop.y + (ELEMENT_HEIGHT - GATEWAY_SIZE) / 2,
+        width: GATEWAY_SIZE,
+        height: GATEWAY_SIZE,
+      })
+      plane.planeElement.push(
+        moddle.create('bpmndi:BPMNShape', {
+          id: `${splitGatewayId}_di`,
+          bpmnElement: splitGateway,
+          bounds: splitGatewayBounds,
+          isMarkerVisible: true,
+        })
+      )
+
+      // Create flow from task to split gateway
+      const taskToSplitFlowId = `Flow_${sanitizeId(stopName)}_to_Split`
+      const taskToSplitFlow = moddle.create('bpmn:SequenceFlow', {
+        id: taskToSplitFlowId,
+        sourceRef: task,
+        targetRef: splitGateway,
+      })
+      process.flowElements.push(taskToSplitFlow)
+      allFlows.push({
+        flow: taskToSplitFlow,
+        sourceElement: task,
+        targetElement: splitGateway,
+      })
+      plane.planeElement.push(
+        moddle.create('bpmndi:BPMNEdge', {
+          id: `${taskToSplitFlowId}_di`,
+          bpmnElement: taskToSplitFlow,
+          waypoint: [
+            moddle.create('dc:Point', {
+              x: stop.x + ELEMENT_WIDTH,
+              y: stop.y + ELEMENT_HEIGHT / 2,
+            }),
+            moddle.create('dc:Point', {
+              x: stop.x + ELEMENT_WIDTH + 20,
+              y: stop.y + ELEMENT_HEIGHT / 2,
+            }),
+          ],
+        })
+      )
+    }
+  }
+
+  // Create sequence flows for all unique edges
+  // Now edges connect: source (or source's split gateway) -> target's merge gateway (or target)
+  let flowIndex = 0
+  for (const [edgeKey, edge] of uniqueEdges) {
+    flowIndex++
+    const flowId = `Flow_${flowIndex}`
+
+    // Determine actual source element
+    let sourceElement: any
+    let sourceX: number
+    let sourceY: number
+
+    if (edge.fromStopId === 'START_GATEWAY') {
+      sourceElement = bpmnElements.get('START_GATEWAY')
+      sourceX = START_X - 25 + GATEWAY_SIZE
+      sourceY = centerY
+    } else {
+      const sourceStop = uniqueStops.get(edge.fromStopId)!
+      // If source has a split gateway, connect from the split gateway
+      if (stopsNeedingSplitGateway.has(edge.fromStopId)) {
+        sourceElement = bpmnElements.get(`SPLIT_${edge.fromStopId}`)
+        sourceX = sourceStop.x + ELEMENT_WIDTH + 20 + GATEWAY_SIZE
+        sourceY = sourceStop.y + ELEMENT_HEIGHT / 2
+      } else {
+        sourceElement = bpmnElements.get(edge.fromStopId)
+        sourceX = sourceStop.x + ELEMENT_WIDTH
+        sourceY = sourceStop.y + ELEMENT_HEIGHT / 2
+      }
+    }
+
+    // Determine actual target element
+    let targetElement: any
+    let targetX: number
+    let targetY: number
+
+    if (edge.toStopId === 'END_GATEWAY') {
+      targetElement = bpmnElements.get('END_GATEWAY')
+      targetX = maxX + HORIZONTAL_SPACING
+      targetY = centerY
+    } else {
+      const targetStop = uniqueStops.get(edge.toStopId)!
+      // If target has a merge gateway, connect to the merge gateway
+      if (stopsNeedingMergeGateway.has(edge.toStopId)) {
+        targetElement = bpmnElements.get(`MERGE_${edge.toStopId}`)
+        targetX = targetStop.x - GATEWAY_SIZE - 20
+        targetY = targetStop.y + ELEMENT_HEIGHT / 2
+      } else {
+        targetElement = bpmnElements.get(edge.toStopId)
+        targetX = targetStop.x
+        targetY = targetStop.y + ELEMENT_HEIGHT / 2
+      }
+    }
+
+    if (!sourceElement || !targetElement) {
+      console.warn(`Missing element for edge: ${edgeKey}`)
+      continue
+    }
+
+    const flow = moddle.create('bpmn:SequenceFlow', {
+      id: flowId,
+      sourceRef: sourceElement,
+      targetRef: targetElement,
+    })
+    process.flowElements.push(flow)
+    allFlows.push({
+      flow,
+      sourceElement,
+      targetElement,
+    })
+
+    plane.planeElement.push(
+      moddle.create('bpmndi:BPMNEdge', {
         id: `${flowId}_di`,
         bpmnElement: flow,
         waypoint: [
-          moddle.create('dc:Point', {
-            x: previousX,
-            y: yOffset + LANE_HEIGHT / 2,
-          }),
-          moddle.create('dc:Point', {
-            x: taskX,
-            y: yOffset + LANE_HEIGHT / 2,
-          }),
+          moddle.create('dc:Point', { x: sourceX, y: sourceY }),
+          moddle.create('dc:Point', { x: targetX, y: targetY }),
         ],
       })
+    )
+  }
 
-      plane.planeElement.push(flowEdge)
-
-      previousElement = task
-      previousX = taskX + ELEMENT_WIDTH
-    }
-
-    // Create end event
-    const endEventId = `EndEvent_${processId}`
-    const endEvent = moddle.create('bpmn:EndEvent', {
-      id: endEventId,
-      name: 'End',
-    })
-    process.flowElements.push(endEvent)
-
-    // Add end event shape
-    const endX = START_X + (elementIndex + 1) * HORIZONTAL_SPACING
-    const endBounds = moddle.create('dc:Bounds', {
-      x: endX,
-      y: yOffset + (LANE_HEIGHT - 36) / 2,
-      width: 36,
-      height: 36,
-    })
-
-    const endShape = moddle.create('bpmndi:BPMNShape', {
-      id: `${endEventId}_di`,
-      bpmnElement: endEvent,
-      bounds: endBounds,
-    })
-
-    plane.planeElement.push(endShape)
-
-    // Create final sequence flow
-    const finalFlowId = `Flow_${processId}_final`
-    const finalFlow = moddle.create('bpmn:SequenceFlow', {
-      id: finalFlowId,
-      sourceRef: previousElement,
-      targetRef: endEvent,
-    })
-    process.flowElements.push(finalFlow)
-
-    // Add final flow edge
-    const finalFlowEdge = moddle.create('bpmndi:BPMNEdge', {
-      id: `${finalFlowId}_di`,
-      bpmnElement: finalFlow,
-      waypoint: [
-        moddle.create('dc:Point', {
-          x: previousX,
-          y: yOffset + LANE_HEIGHT / 2,
-        }),
-        moddle.create('dc:Point', {
-          x: endX,
-          y: yOffset + LANE_HEIGHT / 2,
-        }),
-      ],
-    })
-
-    plane.planeElement.push(finalFlowEdge)
-
-    yOffset += LANE_HEIGHT + 20
+  // Wire up incoming/outgoing references for all flows
+  for (const { flow, sourceElement, targetElement } of allFlows) {
+    sourceElement.outgoing.push(flow)
+    targetElement.incoming.push(flow)
   }
 
   // Add the diagram to definitions
@@ -440,6 +815,8 @@ async function generateBpmn(baseFileName: ValidBaseFileName) {
 
   console.log(`BPMN file written to ${outputPath}`)
   console.log(`Total route variants: ${routeVariants.length}`)
+  console.log(`Unique stops: ${uniqueStops.size}`)
+  console.log(`Unique edges: ${uniqueEdges.size}`)
 }
 
 // Main execution
